@@ -2,6 +2,11 @@
 
 import os
 import sys
+
+# Disable torch.compile / TorchDynamo entirely — Triton is not available on
+# Windows, so every compile attempt would fail and fall back to eager anyway.
+# Setting this before any torch import avoids all compile overhead and noise.
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 import time
 import tempfile
 import subprocess
@@ -65,6 +70,11 @@ SLEEPING_VIDEO      = os.path.join(VIDEOS_DIR, "sleeping.mp4")
 # MuseTalk output goes here (temp, overwritten each turn)
 MUSETALK_OUT_DIR    = os.path.join(BASE_DIR, "musetalk_out")
 os.makedirs(MUSETALK_OUT_DIR, exist_ok=True)
+
+# Pre-generated startup lipsync video + audio (generated once, reused every run)
+STARTUP_TEXT = "ComCentre online. DREAM is ready. Say Hey DREAM to wake me."
+STARTUP_VID  = os.path.join(VIDEOS_DIR, "startup_intro.mp4")
+STARTUP_WAV  = os.path.join(AUDIO_DIR,  "startup.wav")
 
 if IS_WINDOWS:
     VENV_DIR  = os.path.join(BASE_DIR, "venv311")
@@ -145,7 +155,7 @@ def get_piper_sample_rate():
     json_path = VOICE_MODEL + ".json"
     if os.path.exists(json_path):
         try:
-            with open(json_path) as fh:
+            with open(json_path, encoding="utf-8") as fh:
                 cfg = json.load(fh)
             sr = cfg.get("audio", {}).get("sample_rate")
             if sr:
@@ -281,6 +291,13 @@ _mt_vae = _mt_unet = _mt_pe = _mt_audio_processor = _mt_whisper = None
 _mt_device = None
 _mt_weight_dtype = None
 _mt_timesteps = None
+_musetalk_lock = threading.Lock()   # prevents concurrent GPU inference
+
+# Reference-video caches — populated once on first run_musetalk() call
+_mt_ref_cycle  = None   # (frame_list_cycle, coord_list_cycle, latent_list_cycle)
+_mt_ref_fp     = None   # FaceParsing instance (reused across calls)
+_mt_ref_fps    = 25.0   # fps of musetalk_talk.mp4
+_mt_timesteps = None
 
 def _load_musetalk():
     """Lazy-load MuseTalk models once. Skips gracefully if not installed."""
@@ -291,33 +308,38 @@ def _load_musetalk():
     if _musetalk_loaded:
         return True
 
-    musetalk_dir = os.path.join(BASE_DIR, "musetalk")
-    if not os.path.isdir(musetalk_dir):
-        console.print("[yellow]MuseTalk directory not found — lipsync disabled[/yellow]")
+    # scripts/ directory contains the musetalk package
+    scripts_dir = os.path.join(BASE_DIR, "scripts")
+    if not os.path.isdir(scripts_dir):
+        console.print("[yellow]scripts/ not found — lipsync disabled[/yellow]")
         return False
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
 
-    # Add musetalk to path so its internal imports work
-    if musetalk_dir not in sys.path:
-        sys.path.insert(0, musetalk_dir)
+    models_dir = os.path.join(BASE_DIR, "models")
 
     try:
         import torch
         from transformers import WhisperModel
         from musetalk.utils.audio_processor import AudioProcessor
-        from musetalk.utils.utils import load_all_model
+        from musetalk.models.vae import VAE
+        from musetalk.models.unet import UNet, PositionalEncoding
 
-        _mt_device = torch.device("cuda" if CUDA_AVAILABLE else "cpu")
+        _mt_device       = torch.device("cuda" if CUDA_AVAILABLE else "cpu")
         _mt_weight_dtype = torch.float16 if CUDA_AVAILABLE else torch.float32
 
-        models_dir = os.path.join(musetalk_dir, "models")
-        _mt_vae, _mt_unet, _mt_pe = load_all_model(
-            unet_model_path=os.path.join(models_dir, "musetalkV15", "unet.pth"),
-            vae_type="sd-vae",
+        # Instantiate directly with absolute paths (bypasses load_all_model's
+        # relative-path construction that only works from the project root)
+        _mt_vae  = VAE(model_path=os.path.join(models_dir, "sd-vae"))
+        _mt_unet = UNet(
             unet_config=os.path.join(models_dir, "musetalkV15", "musetalk.json"),
+            model_path=os.path.join(models_dir, "musetalkV15", "unet.pth"),
             device=_mt_device,
         )
-        _mt_pe       = _mt_pe.to(_mt_device).to(_mt_weight_dtype)
-        _mt_vae.vae  = _mt_vae.vae.to(_mt_device).to(_mt_weight_dtype)
+        _mt_pe = PositionalEncoding(d_model=384)
+
+        _mt_pe         = _mt_pe.to(_mt_device).to(_mt_weight_dtype)
+        _mt_vae.vae    = _mt_vae.vae.to(_mt_device).to(_mt_weight_dtype)
         _mt_unet.model = _mt_unet.model.to(_mt_device).to(_mt_weight_dtype)
 
         whisper_path = os.path.join(models_dir, "whisper")
@@ -327,52 +349,188 @@ def _load_musetalk():
         _mt_whisper.requires_grad_(False)
 
         _mt_timesteps = torch.tensor([0], device=_mt_device)
+        console.print(f"[green]OK[/green] MuseTalk models on {_mt_device}")
+
+        # Build reference-video cache while still in this background thread.
+        # _musetalk_loaded is only set True once the cache is ready, so
+        # run_musetalk() will never be called before this completes.
+        _build_ref_cache()
 
         _musetalk_loaded = True
-        console.print(f"[green]OK[/green] MuseTalk loaded on {_mt_device}")
+        console.print("[green]OK[/green] MuseTalk ready (models + reference cache)")
         return True
 
     except Exception as e:
         console.print(f"[yellow]MuseTalk load failed ({e}) — lipsync disabled[/yellow]")
+        import traceback; traceback.print_exc()
         return False
+
+
+def _build_ref_cache():
+    """
+    Extract frames from musetalk_talk.mp4, detect face landmarks, and
+    VAE-encode all reference frames.  Results are stored in the _mt_ref_*
+    module globals and reused on every run_musetalk() call.
+    """
+    global _mt_ref_cycle, _mt_ref_fp, _mt_ref_fps
+
+    if _mt_ref_cycle is not None:
+        return
+    if not os.path.exists(MUSETALK_TALK_VIDEO):
+        console.print("[yellow]musetalk_talk.mp4 not found — no reference cache[/yellow]")
+        return
+
+    try:
+        import glob, pickle, imageio
+        from musetalk.utils.face_parsing  import FaceParsing
+        from musetalk.utils.utils         import get_video_fps
+        from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
+
+        extra_margin     = 10
+        input_basename   = os.path.splitext(os.path.basename(MUSETALK_TALK_VIDEO))[0]
+        frames_cache_dir = os.path.join(MUSETALK_OUT_DIR, input_basename + "_frames")
+        coord_cache_path = os.path.join(MUSETALK_OUT_DIR, input_basename + ".pkl")
+
+        # ── Extract reference frames to disk (used for landmark detection) ──
+        if not os.path.isdir(frames_cache_dir) or not os.listdir(frames_cache_dir):
+            console.print("[dim]Extracting reference frames...[/dim]")
+            os.makedirs(frames_cache_dir, exist_ok=True)
+            reader = imageio.get_reader(MUSETALK_TALK_VIDEO)
+            for i, im in enumerate(reader):
+                imageio.imwrite(f"{frames_cache_dir}/{i:08d}.png", im)
+
+        input_img_list = sorted(glob.glob(
+            os.path.join(frames_cache_dir, "*.[jpJP][pnPN]*[gG]")
+        ))
+        _mt_ref_fps = get_video_fps(MUSETALK_TALK_VIDEO)
+
+        # ── Face landmarks (disk-cached across restarts) ──────────────────
+        if os.path.exists(coord_cache_path):
+            console.print("[dim]Loading cached face landmarks...[/dim]")
+            with open(coord_cache_path, "rb") as f:
+                coord_list = pickle.load(f)
+            frame_list = read_imgs(input_img_list)
+        else:
+            console.print("[dim]Detecting face landmarks (one-time, ~30s)...[/dim]")
+            coord_list, frame_list = get_landmark_and_bbox(input_img_list, 0)
+            with open(coord_cache_path, "wb") as f:
+                pickle.dump(coord_list, f)
+
+        # ── VAE-encode all reference crops (GPU, cached in memory) ────────
+        console.print("[dim]Encoding reference latents...[/dim]")
+        latent_list = []
+        for bbox, frame in zip(coord_list, frame_list):
+            if bbox == coord_placeholder:
+                continue
+            x1, y1, x2, y2 = bbox
+            y2   = min(y2 + extra_margin, frame.shape[0])
+            crop = cv2.resize(frame[y1:y2, x1:x2], (256, 256),
+                              interpolation=cv2.INTER_LANCZOS4)
+            latent_list.append(_mt_vae.get_latents_for_unet(crop))
+
+        _mt_ref_fp    = FaceParsing(left_cheek_width=90, right_cheek_width=90)
+        _mt_ref_cycle = (
+            frame_list  + frame_list[::-1],
+            coord_list  + coord_list[::-1],
+            latent_list + latent_list[::-1],
+        )
+        console.print("[green]Reference cache ready[/green]"
+                      f" ({len(frame_list)} frames)")
+
+    except Exception as e:
+        console.print(f"[yellow]Reference cache failed: {e}[/yellow]")
+        import traceback; traceback.print_exc()
 
 
 def run_musetalk(audio_wav_path: str) -> str | None:
     """
-    Run MuseTalk inference using MUSETALK_TALK_VIDEO + audio_wav_path.
-    Returns path to the output lipsynced video, or None on failure.
-    """
-    if not os.path.exists(MUSETALK_TALK_VIDEO):
-        console.print(f"[yellow]musetalk_talk.mp4 not found at {MUSETALK_TALK_VIDEO}[/yellow]")
-        return None
+    Run MuseTalk inference on audio_wav_path against MUSETALK_TALK_VIDEO.
 
+    Optimisations vs. the naive version:
+      • Reference frames, face-coords, VAE latents and FaceParsing are
+        computed once and kept in module-level caches (_mt_ref_*).
+      • No intermediate PNG files — composite frames are written directly
+        to the output video with imageio.
+      • No moviepy — audio is played by pygame separately, so the video
+        is silent and does not need the heavy moviepy audio-mux step.
+    """
+    global _mt_ref_cycle, _mt_ref_fp, _mt_ref_fps
+
+    if not os.path.exists(MUSETALK_TALK_VIDEO):
+        console.print("[yellow]musetalk_talk.mp4 not found — lipsync skipped[/yellow]")
+        return None
     if not _load_musetalk():
         return None
 
     try:
-        # Import inference function from musetalk.py (same directory as this file)
-        musetalk_script = os.path.join(BASE_DIR, "musetalk.py")
-        if not os.path.exists(musetalk_script):
-            musetalk_script = os.path.join(os.path.dirname(__file__), "musetalk.py")
+        import copy, imageio
+        from musetalk.utils.blending      import get_image
+        from musetalk.utils.utils         import datagen
+        from musetalk.utils.preprocessing import coord_placeholder
 
-        # We call inference() directly by importing it
-        sys.path.insert(0, os.path.dirname(musetalk_script))
-        from scripts.run_musetalk import inference  # type: ignore
+        extra_margin = 10
+        batch_size   = 8
 
-        out_path, _ = inference(
-            audio_path  = audio_wav_path,
-            video_path  = MUSETALK_TALK_VIDEO,
-            bbox_shift  = 0,
-            extra_margin= 10,
-            parsing_mode= "jaw",
-            left_cheek_width  = 90,
-            right_cheek_width = 90,
+        if _mt_ref_cycle is None:
+            console.print("[yellow]Reference cache not ready — lipsync skipped[/yellow]")
+            return None
+
+        frame_list_cycle, coord_list_cycle, latent_list_cycle = _mt_ref_cycle
+
+        # ── Audio features (computed fresh for every call) ────────────────────
+        whisper_feats, librosa_length = _mt_audio_processor.get_audio_feature(audio_wav_path)
+        whisper_chunks = _mt_audio_processor.get_whisper_chunk(
+            whisper_feats, _mt_device, _mt_weight_dtype, _mt_whisper, librosa_length,
+            fps=_mt_ref_fps,
+            audio_padding_length_left=2, audio_padding_length_right=2,
         )
-        console.print(f"[green]MuseTalk output:[/green] {out_path}")
-        return out_path
+
+        # ── UNet inference ────────────────────────────────────────────────────
+        console.print("[dim]MuseTalk inference...[/dim]")
+        gen = datagen(
+            whisper_chunks     = whisper_chunks,
+            vae_encode_latents = latent_list_cycle,
+            batch_size         = batch_size,
+            delay_frame        = 0,
+            device             = _mt_device,
+        )
+        res_frame_list = []
+        for wb, lb in gen:
+            af = _mt_pe(wb)
+            lb = lb.to(dtype=_mt_weight_dtype)
+            pred = _mt_unet.model(lb, _mt_timesteps, encoder_hidden_states=af).sample
+            for rf in _mt_vae.decode_latents(pred):
+                res_frame_list.append(rf)
+
+        # ── Composite + write directly to video (no intermediate PNGs) ───────
+        output_vid = os.path.join(MUSETALK_OUT_DIR, f"speech_{int(time.time())}.mp4")
+        writer = imageio.get_writer(
+            output_vid, fps=25, codec="libx264",
+            quality=7, pixelformat="yuv420p", macro_block_size=None,
+        )
+        fp = _mt_ref_fp
+        for i, res_frame in enumerate(res_frame_list):
+            bbox      = coord_list_cycle[i % len(coord_list_cycle)]
+            ori_frame = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
+            if bbox == coord_placeholder:
+                continue
+            x1, y1, x2, y2 = bbox
+            y2 = min(y2 + extra_margin, ori_frame.shape[0])
+            try:
+                res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+            except Exception:
+                continue
+            combine = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode="jaw", fp=fp)
+            # get_image returns BGR; imageio writer expects RGB
+            writer.append_data(cv2.cvtColor(combine, cv2.COLOR_BGR2RGB))
+        writer.close()
+
+        console.print(f"[green]MuseTalk →[/green] {os.path.basename(output_vid)}")
+        return output_vid
 
     except Exception as e:
-        console.print(f"[red]MuseTalk inference error: {e}[/red]")
+        console.print(f"[red]MuseTalk error: {e}[/red]")
+        import traceback; traceback.print_exc()
         return None
 
 # ==================== BANNER ====================
@@ -463,16 +621,15 @@ _whisper_model = None
 def get_whisper():
     global _whisper_model
     if _whisper_model is None:
-        console.print("[dim]Loading Whisper...[/dim]")
+        console.print("[dim]Loading Whisper (CPU — keeps GPU free for MuseTalk)...[/dim]")
         import whisper
-        device = "cuda" if CUDA_AVAILABLE else "cpu"
-        _whisper_model = whisper.load_model("tiny", device=device)
-        console.print(f"[green]OK[/green] Whisper ready (device={device})")
+        _whisper_model = whisper.load_model("tiny", device="cpu")
+        console.print("[green]OK[/green] Whisper ready (device=cpu)")
     return _whisper_model
 
 def transcribe_file(filepath):
     try:
-        result = get_whisper().transcribe(filepath, language="en", fp16=CUDA_AVAILABLE)
+        result = get_whisper().transcribe(filepath, language="en", fp16=False)
         return result["text"].strip()
     except Exception as e:
         console.print(f"[red]STT error: {e}[/red]")
@@ -569,17 +726,42 @@ def ask_llm(prompt, history):
 
 # ==================== SPEAK (Piper → MuseTalk → display) ====================
 
+def _play_wav(wav_path: str):
+    """Play a WAV through pygame.mixer.Sound and block until done.
+
+    Uses Sound (not music) because mixer.music.get_busy() hangs indefinitely
+    on some Windows audio stacks.  Falls back to a time.sleep duration guard
+    so the caller is never blocked forever.
+    """
+    sound = None
+    try:
+        sound   = pygame.mixer.Sound(wav_path)
+        channel = sound.play()
+        if channel is None:
+            console.print("[yellow]Audio: no free mixer channel[/yellow]")
+            return
+        deadline = time.time() + sound.get_length() + 2.0
+        while channel.get_busy() and time.time() < deadline:
+            time.sleep(0.05)
+        channel.stop()
+    except Exception as e:
+        console.print(f"[red]Audio error: {e}[/red]")
+    finally:
+        del sound       # release pygame's file handle before caller deletes the file
+
+
 def speak(text):
     """
-    Full pipeline:
-      Piper TTS → WAV file → MuseTalk lipsync → force_video display + audio playback
-    Falls back to plain audio-only playback if MuseTalk is unavailable.
+    Piper TTS → WAV → audio plays immediately.
+    MuseTalk lipsync runs concurrently in a background thread (if models are
+    loaded and the lock is free).  The lipsync video is queued into
+    force_video when ready — it plays over the idle/talking video pool
+    as soon as inference completes.
     """
     if not text:
         return
     console.print(f"\n[bold cyan]DREAM:[/bold cyan] {text}\n")
 
-    # --- Step 1: Piper TTS → WAV ---
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=AUDIO_DIR)
     tmp.close()
     try:
@@ -595,33 +777,51 @@ def speak(text):
 
         set_state("talking")
 
-        # --- Step 2: MuseTalk lipsync ---
-        lipsync_video = run_musetalk(tmp.name)
+        # MuseTalk runs in a background thread so audio plays immediately.
+        # We keep the "talking" state alive until the lipsync video has been
+        # queued, so it plays right after audio instead of being lost.
+        mt_ready = threading.Event()
+        if _musetalk_loaded and _musetalk_lock.acquire(blocking=False):
+            import shutil as _shutil
+            mt_wav = tmp.name + ".mt.wav"
+            _shutil.copy(tmp.name, mt_wav)
 
-        if lipsync_video and os.path.exists(lipsync_video):
-            # Queue lipsynced video — VideoStateManager will play it
-            # Audio is baked into the lipsync video by MuseTalk, so play it
-            # via pygame from the video's embedded audio track using a temp extract,
-            # OR simply let the VideoPlayer play the video (visual) while we play
-            # the original WAV on the mixer (they stay in sync since MuseTalk
-            # uses the same audio).
-            _state["force_video"] = lipsync_video
-            sound   = pygame.mixer.Sound(tmp.name)
-            channel = sound.play()
-            while channel and channel.get_busy():
-                time.sleep(0.05)
+            def _mt_thread():
+                try:
+                    vid = run_musetalk(mt_wav)
+                    if vid and os.path.exists(vid):
+                        _state["force_video"] = vid
+                except Exception as e:
+                    console.print(f"[yellow]MuseTalk bg error: {e}[/yellow]")
+                finally:
+                    _musetalk_lock.release()
+                    mt_ready.set()
+                    if os.path.exists(mt_wav):
+                        os.unlink(mt_wav)
+
+            threading.Thread(target=_mt_thread, daemon=True).start()
         else:
-            # MuseTalk not available — fall back to plain audio
-            sound   = pygame.mixer.Sound(tmp.name)
-            channel = sound.play()
-            while channel and channel.get_busy():
-                time.sleep(0.05)
+            mt_ready.set()
+
+        # Audio plays immediately — no waiting for MuseTalk
+        _play_wav(tmp.name)
+
+        # After audio, wait up to 60s for the lipsync video to be queued so
+        # the display can play it before we transition to idle.
+        mt_ready.wait(timeout=60)
 
     except Exception as e:
         console.print(f"[red]TTS failed: {e}[/red]")
+        import traceback; traceback.print_exc()
     finally:
-        if os.path.exists(tmp.name):
-            os.unlink(tmp.name)
+        # Retry deletion — Windows briefly locks WAV files after pygame releases them
+        for _ in range(10):
+            try:
+                if os.path.exists(tmp.name):
+                    os.unlink(tmp.name)
+                break
+            except PermissionError:
+                time.sleep(0.05)
         set_state("idle")
 
 # ==================== SYSTEM STATS ====================
@@ -993,6 +1193,10 @@ class VideoStateManager:
 # ==================== MAIN VOICE LOOP ====================
 
 def voice_loop():
+    # Kick off MuseTalk model loading immediately so models are warm
+    # before the user's first real request.
+    threading.Thread(target=_load_musetalk, daemon=True).start()
+
     try:
         r      = requests.get("http://localhost:11434/api/tags", timeout=3)
         models = [m["name"] for m in r.json().get("models", [])]
@@ -1000,15 +1204,21 @@ def voice_loop():
         if not any(MODEL in m for m in models):
             console.print(f"[yellow]'{MODEL}' not pulled.[/yellow]")
     except Exception:
-        console.print("[red]Ollama not running.[/red]")
-        _state["running"] = False
+        console.print("[red]Ollama not running — voice loop disabled. Display will still open.[/red]")
         return
 
     get_whisper()
-    speak("ComCentre online. DREAM is ready. Say Hey DREAM to wake me.")
 
-    # Pre-load MuseTalk in background so first speak isn't slow
-    threading.Thread(target=_load_musetalk, daemon=True).start()
+    # Startup announcement — use pre-generated lipsync video if available,
+    # otherwise fall back to plain audio with the talking video pool.
+    if os.path.exists(STARTUP_VID) and os.path.exists(STARTUP_WAV):
+        console.print("[green]Playing pre-generated startup intro[/green]")
+        set_state("talking")
+        _state["force_video"] = STARTUP_VID
+        _play_wav(STARTUP_WAV)
+        set_state("idle")
+    else:
+        speak(STARTUP_TEXT)
 
     history = []
 
@@ -1076,9 +1286,18 @@ def voice_loop():
 # ==================== DISPLAY (main thread) ====================
 
 def run_display():
+    console.print("[dim]>> run_display: enter[/dim]")
+
     info   = pygame.display.Info()
     SW, SH = info.current_w, info.current_h
-    screen = pygame.display.set_mode((SW, SH), pygame.FULLSCREEN | pygame.NOFRAME)
+    console.print(f"[dim]>> Display info: {SW}x{SH}[/dim]")
+
+    # Borderless windowed fullscreen — avoids SDL's FULLSCREEN mode which
+    # crashes at the C level on some Windows/driver configurations.
+    os.environ["SDL_VIDEO_WINDOW_POS"] = "0,0"
+    screen = pygame.display.set_mode((SW, SH), pygame.NOFRAME)
+    console.print("[dim]>> Borderless window created[/dim]")
+
     pygame.display.set_caption("DREAM")
     pygame.mouse.set_visible(False)
 
@@ -1090,12 +1309,20 @@ def run_display():
     vsm   = VideoStateManager(SW, SH)
     clock = pygame.time.Clock()
 
+    console.print(f"[dim]>> Entering display loop (running={_state['running']})[/dim]")
+
+    # Drain any stale events (e.g. SDL_QUIT that Windows fires when a new
+    # fullscreen window is created and immediately loses focus)
+    pygame.event.clear()
+
     while _state["running"]:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                console.print("[dim]>> pygame.QUIT event — exiting[/dim]")
                 _state["running"] = False
             if event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    console.print(f"[dim]>> Key exit: {event.key}[/dim]")
                     _state["running"] = False
 
         state  = _state["value"]
@@ -1106,6 +1333,7 @@ def run_display():
         pygame.display.flip()
         clock.tick(30)
 
+    console.print(f"[dim]>> Display loop exited (running={_state['running']})[/dim]")
     vsm.release()
     pygame.quit()
 
@@ -1117,14 +1345,20 @@ def main():
     piper_sr = get_piper_sample_rate()
     console.print(f"[dim]Mixer init: {piper_sr} Hz, 16-bit mono, buffer=4096[/dim]")
     pygame.mixer.pre_init(frequency=piper_sr, size=-16, channels=1, buffer=4096)
-    pygame.init()
-    pygame.mixer.init()
-    console.print(
-        f"[green]OK[/green] Mixer: "
-        f"{pygame.mixer.get_init()[0]} Hz / "
-        f"{pygame.mixer.get_init()[1]}-bit / "
-        f"{pygame.mixer.get_init()[2]} ch"
-    )
+
+    init_ok, init_fail = pygame.init()
+    console.print(f"[dim]pygame.init(): {init_ok} OK, {init_fail} failed[/dim]")
+
+    try:
+        pygame.mixer.init()
+    except Exception as e:
+        console.print(f"[yellow]Mixer init warning: {e} — continuing without audio[/yellow]")
+
+    mixer_info = pygame.mixer.get_init()
+    if mixer_info:
+        console.print(f"[green]OK[/green] Mixer: {mixer_info[0]} Hz / {mixer_info[1]}-bit / {mixer_info[2]} ch")
+    else:
+        console.print("[yellow]Mixer not available — audio will be silent[/yellow]")
 
     # Background watchers
     ft = threading.Thread(target=flirt_watcher, daemon=True)
@@ -1135,8 +1369,20 @@ def main():
 
     vt = threading.Thread(target=voice_loop, daemon=True)
     vt.start()
-    run_display()
+
+    try:
+        run_display()
+    except Exception:
+        import traceback as _tb
+        console.print("[red]Display crashed — see below[/red]")
+        _tb.print_exc()
+
     vt.join(timeout=2)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+        input("Press Enter to exit...")

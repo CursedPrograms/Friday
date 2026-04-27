@@ -12,6 +12,17 @@ import face_alignment
 from face_alignment import LandmarksType
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Disable torch.compile / TorchDynamo — Triton is unavailable on Windows so
+# every compile attempt fails anyway.  Setting TORCH_COMPILE_DISABLE=1 in
+# dream.py covers the normal runtime path; this covers standalone execution.
+import os as _os
+_os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+import torch._dynamo as _dynamo
+_dynamo.config.suppress_errors = True
+import logging as _logging
+_logging.getLogger("torch._dynamo").setLevel(_logging.CRITICAL)
+
 fa = face_alignment.FaceAlignment(LandmarksType.TWO_D, flip_input=False, device=device)
 
 # Auto-detect which landmark method this version of face_alignment exposes
@@ -70,9 +81,25 @@ def _get_landmarks(frame_bgr):
 
 
 def _get_bboxes(frames_bgr):
-    """Return per-frame bounding boxes for a list of BGR frames."""
-    batch_rgb = np.array([cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames_bgr])
-    return fa.get_detections_for_batch(batch_rgb)
+    """Return per-frame bounding boxes derived from 68-pt landmarks.
+
+    face_alignment ≥1.4 removed get_detections_for_batch; we derive the
+    coarse bbox from the landmarks that are already available via _landmark_fn.
+    The bbox is only used as a fallback in get_landmark_and_bbox when the
+    refined landmark-based bbox is degenerate, so precision here is fine.
+    """
+    bboxes = []
+    for frame in frames_bgr:
+        lms = _get_landmarks(frame)
+        if lms is None or len(lms) == 0:
+            bboxes.append(None)
+        else:
+            pts = lms[0].astype(np.float32)
+            bboxes.append(np.array([
+                pts[:, 0].min(), pts[:, 1].min(),
+                pts[:, 0].max(), pts[:, 1].max(),
+            ], dtype=np.float32))
+    return bboxes
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -113,14 +140,14 @@ def get_bbox_range(img_list, upperbondrange=0):
 
     if not range_minus_vals:
         return (
-            f"Total frame:「{len(frames)}」 "
+            f"Total frame:[{len(frames)}] "
             f"No faces detected. current value: {upperbondrange}"
         )
 
     avg_minus = int(sum(range_minus_vals) / len(range_minus_vals))
     avg_plus  = int(sum(range_plus_vals)  / len(range_plus_vals))
     return (
-        f"Total frame:「{len(frames)}」 "
+        f"Total frame:[{len(frames)}] "
         f"Manually adjust range : [ -{avg_minus}~{avg_plus} ] , "
         f"the current value: {upperbondrange}"
     )
@@ -183,7 +210,7 @@ def get_landmark_and_bbox(img_list, upperbondrange=0):
         avg_plus  = int(sum(range_plus_vals)  / len(range_plus_vals))
         print("=" * 80)
         print(
-            f"Total frame:「{len(frames)}」 "
+            f"Total frame:[{len(frames)}] "
             f"Manually adjust range : [ -{avg_minus}~{avg_plus} ] , "
             f"the current value: {upperbondrange}"
         )

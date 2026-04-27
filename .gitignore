@@ -167,9 +167,8 @@ en_US-amy-medium.onnx.json
 /models
 /scripts/results
 
-*.pkl
+
 *.jpg
-*.mp4
 *.pth
 *.pyc
 __pycache__
@@ -184,3 +183,4 @@ evaluation/test_filelists/lr*.txt
 *.mp3
 
 /Wav2Lip/checkpoints
+.claude/settings.local.json
