@@ -14,6 +14,7 @@
     },
     "DREAM": {
       "CharName": "DREAM",
+      "LipsyncEnabled": true,
       "Host": "0.0.0.0",
       "Port": 5001,
       "StaticIP": "192.168.1.100",

@@ -158,8 +158,9 @@ STATS_TRIGGERS = [
 with open(os.path.join(BASE_DIR, "config.json")) as f:
     config = json.load(f)
 
-CHAR_NAME     = config["Config"]["DREAM"]["CharName"]
-SYSTEM_PROMPT = config["Config"]["DREAM"]["SystemPrompt"].format(name=CHAR_NAME)
+CHAR_NAME       = config["Config"]["DREAM"]["CharName"]
+SYSTEM_PROMPT   = config["Config"]["DREAM"]["SystemPrompt"].format(name=CHAR_NAME)
+LIPSYNC_ENABLED = config["Config"]["DREAM"].get("LipsyncEnabled", True)
 
 print("CharName:", CHAR_NAME)
 print("SystemPrompt:", SYSTEM_PROMPT)
@@ -830,7 +831,7 @@ def speak(text):
 
         mt_ready = threading.Event()
 
-        if _musetalk_loaded and _musetalk_lock.acquire(blocking=False):
+        if LIPSYNC_ENABLED and _musetalk_loaded and _musetalk_lock.acquire(blocking=False):
             import shutil as _shutil
             mt_wav = tmp.name + ".mt.wav"
             _shutil.copy(tmp.name, mt_wav)
@@ -1254,11 +1255,14 @@ class VideoStateManager:
 # ==================== MAIN VOICE LOOP ====================
 
 def voice_loop():
-    # Load any pre-cached lipsync videos (Yes?, startup, etc.)
-    _init_lipsync_cache()
-    # Kick off MuseTalk model loading immediately so models are warm
-    # before the user's first real request.
-    threading.Thread(target=_load_musetalk, daemon=True).start()
+    if LIPSYNC_ENABLED:
+        # Load any pre-cached lipsync videos (Yes?, startup, etc.)
+        _init_lipsync_cache()
+        # Kick off MuseTalk model loading immediately so models are warm
+        # before the user's first real request.
+        threading.Thread(target=_load_musetalk, daemon=True).start()
+    else:
+        console.print("[yellow]Lipsync disabled via config[/yellow]")
 
     try:
         r      = requests.get("http://localhost:11434/api/tags", timeout=3)
@@ -1276,7 +1280,7 @@ def voice_loop():
     # Cached path: instant lipsync from pre-generated files.
     # First-run path: wait for MuseTalk models to be ready, then speak() will
     # run inference and auto-save startup_intro.mp4 + startup.wav for next run.
-    if not (os.path.exists(STARTUP_VID) and os.path.exists(STARTUP_WAV)):
+    if LIPSYNC_ENABLED and not (os.path.exists(STARTUP_VID) and os.path.exists(STARTUP_WAV)):
         console.print("[dim]First run — waiting for MuseTalk to generate startup cache...[/dim]")
         deadline = time.time() + 120
         while not _musetalk_loaded and time.time() < deadline:
