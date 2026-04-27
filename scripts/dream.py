@@ -76,6 +76,37 @@ STARTUP_TEXT = "ComCentre online. DREAM is ready. Say Hey DREAM to wake me."
 STARTUP_VID  = os.path.join(VIDEOS_DIR, "startup_intro.mp4")
 STARTUP_WAV  = os.path.join(AUDIO_DIR,  "startup.wav")
 
+# Lipsync cache: short fixed responses pre-generated on first use
+# {text: (wav_path, vid_path)} — populated by _init_lipsync_cache() at startup
+_lipsync_cache: dict = {}
+_CACHE_YES_WAV = os.path.join(AUDIO_DIR,  "cache_yes.wav")
+_CACHE_YES_VID = os.path.join(VIDEOS_DIR, "cache_yes_lipsync.mp4")
+
+
+def _init_lipsync_cache():
+    """Populate _lipsync_cache with any pre-built response videos."""
+    entries = [
+        ("Yes?",       _CACHE_YES_WAV, _CACHE_YES_VID),
+        (STARTUP_TEXT, STARTUP_WAV,    STARTUP_VID),
+    ]
+    for text, wav, vid in entries:
+        if os.path.exists(wav) and os.path.exists(vid):
+            _lipsync_cache[text] = (wav, vid)
+            console.print(f"[dim]Lipsync cache: {os.path.basename(vid)}[/dim]")
+
+
+def _save_lipsync_cache(text: str, wav_src: str, vid_src: str,
+                        wav_dst: str, vid_dst: str):
+    """Copy generated wav+vid to permanent cache paths and register them."""
+    import shutil
+    try:
+        shutil.copy(wav_src, wav_dst)
+        shutil.copy(vid_src, vid_dst)
+        _lipsync_cache[text] = (wav_dst, vid_dst)
+        console.print(f"[green]Cached lipsync:[/green] {os.path.basename(vid_dst)}")
+    except Exception as e:
+        console.print(f"[yellow]Cache save failed: {e}[/yellow]")
+
 if IS_WINDOWS:
     VENV_DIR  = os.path.join(BASE_DIR, "venv311")
     PIPER_BIN = os.path.join(VENV_DIR, "Scripts", "piper.exe")
@@ -463,7 +494,8 @@ def run_musetalk(audio_wav_path: str) -> str | None:
         return None
 
     try:
-        import copy, imageio
+        import imageio
+        import torch
         from musetalk.utils.blending      import get_image
         from musetalk.utils.utils         import datagen
         from musetalk.utils.preprocessing import coord_placeholder
@@ -477,7 +509,7 @@ def run_musetalk(audio_wav_path: str) -> str | None:
 
         frame_list_cycle, coord_list_cycle, latent_list_cycle = _mt_ref_cycle
 
-        # ── Audio features (computed fresh for every call) ────────────────────
+        # ── Audio features ────────────────────────────────────────────────────
         whisper_feats, librosa_length = _mt_audio_processor.get_audio_feature(audio_wav_path)
         whisper_chunks = _mt_audio_processor.get_whisper_chunk(
             whisper_feats, _mt_device, _mt_weight_dtype, _mt_whisper, librosa_length,
@@ -485,8 +517,18 @@ def run_musetalk(audio_wav_path: str) -> str | None:
             audio_padding_length_left=2, audio_padding_length_right=2,
         )
 
-        # ── UNet inference ────────────────────────────────────────────────────
+        output_vid = os.path.join(MUSETALK_OUT_DIR, f"speech_{int(time.time())}.mp4")
+        writer = imageio.get_writer(
+            output_vid, fps=25, codec="libx264",
+            quality=7, pixelformat="yuv420p", macro_block_size=None,
+        )
+
+        # ── Single streaming pass: infer → composite → write per batch ────────
+        # torch.inference_mode() disables autograd graph construction — no
+        # gradient tracking overhead during forward passes.
         console.print("[dim]MuseTalk inference...[/dim]")
+        fp  = _mt_ref_fp
+        idx = 0
         gen = datagen(
             whisper_chunks     = whisper_chunks,
             vae_encode_latents = latent_list_cycle,
@@ -494,35 +536,26 @@ def run_musetalk(audio_wav_path: str) -> str | None:
             delay_frame        = 0,
             device             = _mt_device,
         )
-        res_frame_list = []
-        for wb, lb in gen:
-            af = _mt_pe(wb)
-            lb = lb.to(dtype=_mt_weight_dtype)
-            pred = _mt_unet.model(lb, _mt_timesteps, encoder_hidden_states=af).sample
-            for rf in _mt_vae.decode_latents(pred):
-                res_frame_list.append(rf)
-
-        # ── Composite + write directly to video (no intermediate PNGs) ───────
-        output_vid = os.path.join(MUSETALK_OUT_DIR, f"speech_{int(time.time())}.mp4")
-        writer = imageio.get_writer(
-            output_vid, fps=25, codec="libx264",
-            quality=7, pixelformat="yuv420p", macro_block_size=None,
-        )
-        fp = _mt_ref_fp
-        for i, res_frame in enumerate(res_frame_list):
-            bbox      = coord_list_cycle[i % len(coord_list_cycle)]
-            ori_frame = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
-            if bbox == coord_placeholder:
-                continue
-            x1, y1, x2, y2 = bbox
-            y2 = min(y2 + extra_margin, ori_frame.shape[0])
-            try:
-                res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
-            except Exception:
-                continue
-            combine = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode="jaw", fp=fp)
-            # get_image returns BGR; imageio writer expects RGB
-            writer.append_data(cv2.cvtColor(combine, cv2.COLOR_BGR2RGB))
+        with torch.inference_mode():
+            for wb, lb in gen:
+                af   = _mt_pe(wb)
+                lb   = lb.to(dtype=_mt_weight_dtype)
+                pred = _mt_unet.model(lb, _mt_timesteps, encoder_hidden_states=af).sample
+                for rf in _mt_vae.decode_latents(pred):
+                    bbox      = coord_list_cycle[idx % len(coord_list_cycle)]
+                    ori_frame = frame_list_cycle[idx % len(frame_list_cycle)].copy()
+                    idx += 1
+                    if bbox == coord_placeholder:
+                        continue
+                    x1, y1, x2, y2 = bbox
+                    y2 = min(y2 + extra_margin, ori_frame.shape[0])
+                    try:
+                        rf_resized = cv2.resize(rf.astype(np.uint8), (x2 - x1, y2 - y1))
+                    except Exception:
+                        continue
+                    composite = get_image(ori_frame, rf_resized, [x1, y1, x2, y2],
+                                          mode="jaw", fp=fp)
+                    writer.append_data(cv2.cvtColor(composite, cv2.COLOR_BGR2RGB))
         writer.close()
 
         console.print(f"[green]MuseTalk →[/green] {os.path.basename(output_vid)}")
@@ -752,16 +785,28 @@ def _play_wav(wav_path: str):
 
 def speak(text):
     """
-    Piper TTS → WAV → audio plays immediately.
-    MuseTalk lipsync runs concurrently in a background thread (if models are
-    loaded and the lock is free).  The lipsync video is queued into
-    force_video when ready — it plays over the idle/talking video pool
-    as soon as inference completes.
+    Fast path (cached): instant lipsync from pre-generated wav+video.
+    Normal path: Piper TTS → MuseTalk runs in background while display stays
+    in "thinking" state (hides inference delay) → switch to "talking" with
+    audio + lipsync together once MuseTalk finishes.
     """
     if not text:
         return
     console.print(f"\n[bold cyan]DREAM:[/bold cyan] {text}\n")
 
+    # ── Fast path: cached lipsync (Yes?, startup, etc.) ──────────────────────
+    if text in _lipsync_cache:
+        cached_wav, cached_vid = _lipsync_cache[text]
+        if os.path.exists(cached_wav) and os.path.exists(cached_vid):
+            set_state("talking")
+            _state["force_video"] = cached_vid
+            _play_wav(cached_wav)
+            set_state("idle")
+            return
+        # Stale cache entry — files were deleted; fall through to normal path
+        del _lipsync_cache[text]
+
+    # ── Normal path ───────────────────────────────────────────────────────────
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=AUDIO_DIR)
     tmp.close()
     try:
@@ -775,12 +820,16 @@ def speak(text):
         if not os.path.exists(tmp.name) or os.path.getsize(tmp.name) < 100:
             return
 
-        set_state("talking")
+        # Measure audio duration to set a tight MuseTalk wait ceiling.
+        try:
+            import wave as _wave
+            with _wave.open(tmp.name, 'rb') as _wf:
+                audio_secs = _wf.getnframes() / _wf.getframerate()
+        except Exception:
+            audio_secs = 5.0
 
-        # MuseTalk runs in a background thread so audio plays immediately.
-        # We keep the "talking" state alive until the lipsync video has been
-        # queued, so it plays right after audio instead of being lost.
         mt_ready = threading.Event()
+
         if _musetalk_loaded and _musetalk_lock.acquire(blocking=False):
             import shutil as _shutil
             mt_wav = tmp.name + ".mt.wav"
@@ -790,7 +839,15 @@ def speak(text):
                 try:
                     vid = run_musetalk(mt_wav)
                     if vid and os.path.exists(vid):
+                        # Always set force_video directly — this fires whether
+                        # speak() is still waiting or has already played audio.
                         _state["force_video"] = vid
+                        if text == "Yes?":
+                            _save_lipsync_cache(text, mt_wav, vid,
+                                                _CACHE_YES_WAV, _CACHE_YES_VID)
+                        elif text == STARTUP_TEXT:
+                            _save_lipsync_cache(text, mt_wav, vid,
+                                                STARTUP_WAV, STARTUP_VID)
                 except Exception as e:
                     console.print(f"[yellow]MuseTalk bg error: {e}[/yellow]")
                 finally:
@@ -803,12 +860,16 @@ def speak(text):
         else:
             mt_ready.set()
 
-        # Audio plays immediately — no waiting for MuseTalk
-        _play_wav(tmp.name)
+        # Stay in "thinking" state while MuseTalk runs — the animation hides
+        # the inference delay naturally.  Timeout is audio-length-derived so
+        # we never wait longer than necessary on this hardware (RTX 2060:
+        # ~3s overhead + ~2s per second of audio).  After timeout, audio plays
+        # immediately and the background thread queues force_video when done.
+        mt_timeout = max(20.0, audio_secs * 2.5 + 8.0)
+        mt_ready.wait(timeout=mt_timeout)
 
-        # After audio, wait up to 60s for the lipsync video to be queued so
-        # the display can play it before we transition to idle.
-        mt_ready.wait(timeout=60)
+        set_state("talking")
+        _play_wav(tmp.name)
 
     except Exception as e:
         console.print(f"[red]TTS failed: {e}[/red]")
@@ -1193,6 +1254,8 @@ class VideoStateManager:
 # ==================== MAIN VOICE LOOP ====================
 
 def voice_loop():
+    # Load any pre-cached lipsync videos (Yes?, startup, etc.)
+    _init_lipsync_cache()
     # Kick off MuseTalk model loading immediately so models are warm
     # before the user's first real request.
     threading.Thread(target=_load_musetalk, daemon=True).start()
@@ -1209,16 +1272,25 @@ def voice_loop():
 
     get_whisper()
 
-    # Startup announcement — use pre-generated lipsync video if available,
-    # otherwise fall back to plain audio with the talking video pool.
+    # Startup announcement.
+    # Cached path: instant lipsync from pre-generated files.
+    # First-run path: wait for MuseTalk models to be ready, then speak() will
+    # run inference and auto-save startup_intro.mp4 + startup.wav for next run.
+    if not (os.path.exists(STARTUP_VID) and os.path.exists(STARTUP_WAV)):
+        console.print("[dim]First run — waiting for MuseTalk to generate startup cache...[/dim]")
+        deadline = time.time() + 120
+        while not _musetalk_loaded and time.time() < deadline:
+            time.sleep(0.5)
+
     if os.path.exists(STARTUP_VID) and os.path.exists(STARTUP_WAV):
-        console.print("[green]Playing pre-generated startup intro[/green]")
+        console.print("[green]Startup lipsync cache hit[/green]")
+        _lipsync_cache[STARTUP_TEXT] = (STARTUP_WAV, STARTUP_VID)
         set_state("talking")
         _state["force_video"] = STARTUP_VID
         _play_wav(STARTUP_WAV)
         set_state("idle")
     else:
-        speak(STARTUP_TEXT)
+        speak(STARTUP_TEXT)  # Generates + caches startup_intro.mp4 for next run
 
     history = []
 

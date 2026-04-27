@@ -184,3 +184,9 @@ evaluation/test_filelists/lr*.txt
 
 /Wav2Lip/checkpoints
 .claude/settings.local.json
+musetalk_out/speech_1777317920.mp4
+musetalk_out/speech_1777317876.mp4
+musetalk_out/speech_1777317960.mp4
+musetalk_out/speech_1777319357.mp4
+musetalk_out/speech_1777319586.mp4
+musetalk_out/speech_1777319283.mp4
